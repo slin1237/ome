@@ -1022,85 +1022,11 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 		// Compute model hash for P2P coordination
 		modelHash := computeModelHash(hfComponents.ModelID, hfComponents.Branch)
 
-		// Try P2P download first if enabled
-		if s.p2pEnabled && s.p2pDistributor != nil {
-			s.logger.Infof("P2P enabled, attempting peer download for model %s (hash: %s)", modelInfo, modelHash[:16])
-
-			// Check if peers have the model
-			if s.p2pDistributor.HasPeers(ctx, modelHash) {
-				s.logger.Infof("Peers found for model %s, attempting P2P download", modelInfo)
-				err := s.p2pDistributor.TryP2PDownload(ctx, modelHash, s.p2pTimeout)
-				if err == nil {
-					s.logger.Infof("Successfully downloaded model %s via P2P", modelInfo)
-					// Skip HuggingFace download, model is already available
-					goto parseConfig
-				}
-				s.logger.Warnf("P2P download failed for model %s: %v, falling back to HuggingFace", modelInfo, err)
-			} else {
-				s.logger.Infof("No peers available for model %s, will attempt HuggingFace download", modelInfo)
-			}
-
-			// Try to acquire lease for HuggingFace download
-			if s.p2pLeaseManager != nil {
-				leaseName := s.p2pLeaseManager.GetLeaseName(modelHash)
-				acquired, err := s.p2pLeaseManager.TryAcquire(ctx, leaseName)
-				if err != nil {
-					s.logger.Warnf("Failed to acquire P2P lease for model %s: %v", modelInfo, err)
-				}
-
-				if !acquired {
-					// Another node is downloading, wait for P2P availability
-					s.logger.Infof("Lease held by another node for model %s, waiting for P2P availability", modelInfo)
-					if err := s.waitForP2PAvailability(ctx, modelHash, modelInfo); err != nil {
-						s.logger.Warnf("Wait for P2P failed for model %s: %v, proceeding with HuggingFace download", modelInfo, err)
-					} else {
-						s.logger.Infof("Model %s now available via P2P", modelInfo)
-						goto parseConfig
-					}
-				} else {
-					// We have the lease, start renewal and download from HuggingFace
-					s.logger.Infof("Acquired lease for model %s, downloading from HuggingFace", modelInfo)
-					cancelRenewal := s.p2pLeaseManager.StartRenewal(ctx, leaseName)
-					defer cancelRenewal()
-
-					// Download from HuggingFace and seed
-					if err := s.downloadFromHuggingFace(ctx, task, baseModelSpec, hfComponents, destPath, modelInfo, modelType, namespace, name); err != nil {
-						// Release lease on failure
-						s.p2pLeaseManager.Release(ctx, leaseName)
-						return err
-					}
-
-					// Start seeding the downloaded model
-					if err := s.p2pDistributor.SeedModel(destPath, modelHash); err != nil {
-						s.logger.Warnf("Failed to start seeding model %s: %v", modelInfo, err)
-					} else {
-						s.logger.Infof("Started seeding model %s", modelInfo)
-					}
-
-					// Mark lease as complete
-					if err := s.p2pLeaseManager.MarkComplete(ctx, leaseName); err != nil {
-						s.logger.Warnf("Failed to mark lease complete for model %s: %v", modelInfo, err)
-					}
-
-					goto parseConfig
-				}
-			}
-		}
-
-		// Fallback: download directly from HuggingFace (P2P disabled or no lease manager)
-		if err := s.downloadFromHuggingFace(ctx, task, baseModelSpec, hfComponents, destPath, modelInfo, modelType, namespace, name); err != nil {
+		// Try P2P-aware download if enabled, otherwise fallback to direct HF download
+		if err := s.downloadWithP2P(ctx, task, baseModelSpec, hfComponents, destPath, modelHash, modelInfo, modelType, namespace, name); err != nil {
 			return err
 		}
-
-		// Start seeding if P2P is enabled (even without lease coordination)
-		if s.p2pEnabled && s.p2pDistributor != nil {
-			if err := s.p2pDistributor.SeedModel(destPath, modelHash); err != nil {
-				s.logger.Warnf("Failed to start seeding model %s: %v", modelInfo, err)
-			}
-		}
 	}
-
-parseConfig:
 
 	// Parse model config and update ConfigMap
 	var baseModel *v1beta1.BaseModel
@@ -1212,18 +1138,20 @@ func (s *Gopher) downloadFromHuggingFace(ctx context.Context, task *GopherTask, 
 
 // waitForP2PAvailability waits for the model to become available via P2P.
 // This is used when another node holds the download lease.
+// It uses exponential backoff to avoid overwhelming the cluster with DNS lookups.
 func (s *Gopher) waitForP2PAvailability(ctx context.Context, modelHash, modelInfo string) error {
 	if s.p2pDistributor == nil {
 		return fmt.Errorf("P2P distributor not configured")
 	}
 
-	// Poll for P2P availability with exponential backoff
-	maxAttempts := 60 // Max ~5 minutes with exponential backoff
-	baseDelay := 2 * time.Second
-	maxDelay := 30 * time.Second
+	// Use constants for configurable wait behavior
+	maxAttempts := constants.P2PDefaultWaitMaxAttempts
+	baseDelay := time.Duration(constants.P2PDefaultWaitBaseDelayMs) * time.Millisecond
+	maxDelay := time.Duration(constants.P2PDefaultWaitMaxDelayMs) * time.Millisecond
+	backoffDivisor := constants.P2PDefaultWaitBackoffDivisor
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// Check context cancellation
+		// Check context cancellation first
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1233,16 +1161,17 @@ func (s *Gopher) waitForP2PAvailability(ctx context.Context, modelHash, modelInf
 		// Check if model is available via P2P
 		if s.p2pDistributor.HasPeers(ctx, modelHash) {
 			s.logger.Infof("P2P peers now available for model %s, attempting download", modelInfo)
-			err := s.p2pDistributor.TryP2PDownload(ctx, modelHash, s.p2pTimeout)
-			if err == nil {
+			if err := s.p2pDistributor.TryP2PDownload(ctx, modelHash, s.p2pTimeout); err == nil {
 				s.logger.Infof("Successfully downloaded model %s via P2P after waiting", modelInfo)
 				return nil
+			} else {
+				s.logger.Warnf("P2P download attempt failed for model %s: %v", modelInfo, err)
 			}
-			s.logger.Warnf("P2P download attempt failed for model %s: %v", modelInfo, err)
 		}
 
 		// Calculate delay with exponential backoff
-		delay := baseDelay * time.Duration(1<<uint(attempt/10))
+		// Backoff increases every backoffDivisor attempts to avoid rapid polling
+		delay := baseDelay * time.Duration(1<<uint(attempt/backoffDivisor))
 		if delay > maxDelay {
 			delay = maxDelay
 		}
@@ -1257,7 +1186,117 @@ func (s *Gopher) waitForP2PAvailability(ctx context.Context, modelHash, modelInf
 		}
 	}
 
-	return fmt.Errorf("timeout waiting for P2P availability for model %s", modelInfo)
+	return fmt.Errorf("timeout waiting for P2P availability for model %s after %d attempts", modelInfo, maxAttempts)
+}
+
+// downloadWithP2P orchestrates the model download with P2P support.
+// It tries P2P first, then falls back to HuggingFace with lease coordination.
+// This method encapsulates the P2P download flow with proper resource cleanup.
+func (s *Gopher) downloadWithP2P(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
+	hfComponents *storage.HuggingFaceStorageComponents, destPath, modelHash, modelInfo, modelType, namespace, name string) error {
+
+	// If P2P is not enabled, go directly to HuggingFace
+	if !s.p2pEnabled || s.p2pDistributor == nil {
+		return s.downloadFromHuggingFace(ctx, task, baseModelSpec, hfComponents, destPath, modelInfo, modelType, namespace, name)
+	}
+
+	s.logger.Infof("P2P enabled, attempting peer download for model %s (hash: %s)", modelInfo, modelHash[:16])
+
+	// Step 1: Check if peers already have the model
+	if s.p2pDistributor.HasPeers(ctx, modelHash) {
+		s.logger.Infof("Peers found for model %s, attempting P2P download", modelInfo)
+		if err := s.p2pDistributor.TryP2PDownload(ctx, modelHash, s.p2pTimeout); err == nil {
+			s.logger.Infof("Successfully downloaded model %s via P2P", modelInfo)
+			return nil
+		} else {
+			s.logger.Warnf("P2P download failed for model %s: %v, falling back to HuggingFace", modelInfo, err)
+		}
+	} else {
+		s.logger.Infof("No peers available for model %s, will attempt HuggingFace download", modelInfo)
+	}
+
+	// Step 2: Try to acquire lease for HuggingFace download
+	if s.p2pLeaseManager == nil {
+		// No lease manager, just download directly
+		if err := s.downloadFromHuggingFace(ctx, task, baseModelSpec, hfComponents, destPath, modelInfo, modelType, namespace, name); err != nil {
+			return err
+		}
+		// Start seeding after successful download
+		s.startSeeding(destPath, modelHash, modelInfo)
+		return nil
+	}
+
+	leaseName := s.p2pLeaseManager.GetLeaseName(modelHash)
+	acquired, err := s.p2pLeaseManager.TryAcquire(ctx, leaseName)
+	if err != nil {
+		s.logger.Warnf("Failed to acquire P2P lease for model %s: %v, proceeding with direct download", modelInfo, err)
+		// Fall through to direct download
+	}
+
+	if acquired {
+		// We have the lease - download from HuggingFace and seed to others
+		return s.downloadWithLeaseHeld(ctx, task, baseModelSpec, hfComponents, destPath, modelHash, modelInfo, modelType, namespace, name, leaseName)
+	}
+
+	// Lease held by another node - wait for P2P availability
+	s.logger.Infof("Lease held by another node for model %s, waiting for P2P availability", modelInfo)
+	if err := s.waitForP2PAvailability(ctx, modelHash, modelInfo); err == nil {
+		s.logger.Infof("Model %s now available via P2P", modelInfo)
+		return nil
+	} else {
+		s.logger.Warnf("Wait for P2P failed for model %s: %v, proceeding with HuggingFace download", modelInfo, err)
+	}
+
+	// Final fallback: direct HuggingFace download
+	if err := s.downloadFromHuggingFace(ctx, task, baseModelSpec, hfComponents, destPath, modelInfo, modelType, namespace, name); err != nil {
+		return err
+	}
+	s.startSeeding(destPath, modelHash, modelInfo)
+	return nil
+}
+
+// downloadWithLeaseHeld downloads from HuggingFace while holding a lease.
+// It ensures proper cleanup of lease resources regardless of success or failure.
+func (s *Gopher) downloadWithLeaseHeld(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
+	hfComponents *storage.HuggingFaceStorageComponents, destPath, modelHash, modelInfo, modelType, namespace, name, leaseName string) error {
+
+	s.logger.Infof("Acquired lease for model %s, downloading from HuggingFace", modelInfo)
+
+	// Start lease renewal in background
+	cancelRenewal := s.p2pLeaseManager.StartRenewal(ctx, leaseName)
+	defer cancelRenewal()
+
+	// Download from HuggingFace
+	if err := s.downloadFromHuggingFace(ctx, task, baseModelSpec, hfComponents, destPath, modelInfo, modelType, namespace, name); err != nil {
+		// Release lease on failure so another node can try
+		if releaseErr := s.p2pLeaseManager.Release(ctx, leaseName); releaseErr != nil {
+			s.logger.Warnf("Failed to release lease after download failure for model %s: %v", modelInfo, releaseErr)
+		}
+		return err
+	}
+
+	// Start seeding the downloaded model
+	s.startSeeding(destPath, modelHash, modelInfo)
+
+	// Mark lease as complete so other nodes know P2P is available
+	if err := s.p2pLeaseManager.MarkComplete(ctx, leaseName); err != nil {
+		s.logger.Warnf("Failed to mark lease complete for model %s: %v", modelInfo, err)
+	}
+
+	return nil
+}
+
+// startSeeding begins seeding the model to peers. Errors are logged but not returned
+// since seeding failure shouldn't fail the overall download operation.
+func (s *Gopher) startSeeding(destPath, modelHash, modelInfo string) {
+	if s.p2pDistributor == nil {
+		return
+	}
+	if err := s.p2pDistributor.SeedModel(destPath, modelHash); err != nil {
+		s.logger.Warnf("Failed to start seeding model %s: %v", modelInfo, err)
+	} else {
+		s.logger.Infof("Started seeding model %s", modelInfo)
+	}
 }
 
 /*
