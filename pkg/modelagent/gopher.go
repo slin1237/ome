@@ -2,6 +2,8 @@ package modelagent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"github.com/sgl-project/ome/pkg/apis/ome/v1beta1"
 	omev1beta1lister "github.com/sgl-project/ome/pkg/client/listers/ome/v1beta1"
 	"github.com/sgl-project/ome/pkg/constants"
+	"github.com/sgl-project/ome/pkg/distributor"
 	"github.com/sgl-project/ome/pkg/logging"
 	"github.com/sgl-project/ome/pkg/ociobjectstore"
 	"github.com/sgl-project/ome/pkg/principals"
@@ -62,6 +65,12 @@ type Gopher struct {
 	// Track active downloads for cancellation
 	activeDownloads      map[string]context.CancelFunc // key: model UID
 	activeDownloadsMutex sync.RWMutex
+
+	// P2P distribution components
+	p2pEnabled      bool
+	p2pDistributor  *distributor.ModelDistributor
+	p2pLeaseManager *P2PLeaseManager
+	p2pTimeout      time.Duration
 }
 
 const (
@@ -104,7 +113,33 @@ func NewGopher(
 		activeDownloads:        make(map[string]context.CancelFunc),
 		baseModelLister:        baseModelLister,
 		clusterBaseModelLister: clusterBaseModelLister,
+		p2pTimeout:             time.Duration(constants.P2PDefaultP2PTimeoutSeconds) * time.Second,
 	}, nil
+}
+
+// EnableP2P configures P2P distribution for the Gopher.
+// This must be called before Run() if P2P is desired.
+func (s *Gopher) EnableP2P(dist *distributor.ModelDistributor, leaseManager *P2PLeaseManager) {
+	s.p2pEnabled = true
+	s.p2pDistributor = dist
+	s.p2pLeaseManager = leaseManager
+	s.logger.Info("P2P distribution enabled")
+}
+
+// SetP2PTimeout sets the timeout for P2P download attempts.
+func (s *Gopher) SetP2PTimeout(timeout time.Duration) {
+	s.p2pTimeout = timeout
+}
+
+// computeModelHash generates a hash for the model to use in P2P coordination.
+// The hash is based on the HuggingFace model ID and revision.
+func computeModelHash(modelID, revision string) string {
+	input := modelID
+	if revision != "" {
+		input = modelID + "@" + revision
+	}
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:])
 }
 
 func (s *Gopher) Run(stopCh <-chan struct{}, numWorker int) {
@@ -984,92 +1019,88 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 		}
 		s.logger.Infof("successfully add the new path to childrenPath for model: %s", modelInfo)
 	} else {
-		// Get Hugging Face token from storage key or parameters
-		hfToken := s.getHuggingFaceToken(task, baseModelSpec, modelInfo)
+		// Compute model hash for P2P coordination
+		modelHash := computeModelHash(hfComponents.ModelID, hfComponents.Branch)
 
-		s.logger.Infof("Downloading HuggingFace model %s (revision: %s) to %s",
-			hfComponents.ModelID, hfComponents.Branch, destPath)
+		// Try P2P download first if enabled
+		if s.p2pEnabled && s.p2pDistributor != nil {
+			s.logger.Infof("P2P enabled, attempting peer download for model %s (hash: %s)", modelInfo, modelHash[:16])
 
-		// Init xet HF download config
-		config := s.xetConfig.ToDownloadConfig()
-		config.LocalDir = destPath
-		config.RepoID = hfComponents.ModelID
-
-		// Set revision if specified
-		if hfComponents.Branch != "" {
-			config.Revision = hfComponents.Branch
-		}
-
-		// If we have a token, pass it as a download option
-		if hfToken != "" {
-			s.logger.Infof("Using authentication token for HuggingFace model %s", modelInfo)
-			config.Token = hfToken
-		}
-
-		// Create progress handler for tracking download progress
-		var lastBytes uint64
-		var lastTime = time.Now()
-		progressThrottle := 30 * time.Second // Update ConfigMap every 30 seconds
-
-		progressHandler := func(update xet.ProgressUpdate) {
-			now := time.Now()
-
-			// Calculate speed (bytes per second)
-			var speedBytesPerSec float64
-			elapsed := now.Sub(lastTime).Seconds()
-			if elapsed > 0 && update.CompletedBytes > lastBytes {
-				speedBytesPerSec = float64(update.CompletedBytes-lastBytes) / elapsed
-			}
-			lastBytes = update.CompletedBytes
-			lastTime = now
-
-			// Create progress object
-			progress := &DownloadProgress{
-				Phase:            update.Phase.String(),
-				TotalBytes:       update.TotalBytes,
-				CompletedBytes:   update.CompletedBytes,
-				TotalFiles:       update.TotalFiles,
-				CompletedFiles:   update.CompletedFiles,
-				SpeedBytesPerSec: speedBytesPerSec,
-				LastUpdated:      now.Format(time.RFC3339),
-			}
-
-			// Update ConfigMap with progress (non-blocking)
-			go func() {
-				progressOp := &ConfigMapProgressOp{
-					Progress:         progress,
-					BaseModel:        task.BaseModel,
-					ClusterBaseModel: task.ClusterBaseModel,
+			// Check if peers have the model
+			if s.p2pDistributor.HasPeers(ctx, modelHash) {
+				s.logger.Infof("Peers found for model %s, attempting P2P download", modelInfo)
+				err := s.p2pDistributor.TryP2PDownload(ctx, modelHash, s.p2pTimeout)
+				if err == nil {
+					s.logger.Infof("Successfully downloaded model %s via P2P", modelInfo)
+					// Skip HuggingFace download, model is already available
+					goto parseConfig
 				}
-				if err := s.configMapReconciler.ReconcileModelProgress(ctx, progressOp); err != nil {
-					s.logger.Warnf("Failed to update download progress for %s: %v", modelInfo, err)
-				}
-			}()
-		}
-
-		// Perform snapshot download with progress tracking
-		// Note: Progress is cleared atomically with status update in ReconcileModelStatus
-		// when status becomes Ready/Failed, ensuring the controller sees the final progress
-		downloadPath, err := xet.SnapshotDownloadWithProgress(ctx, config, progressHandler, progressThrottle)
-
-		if err != nil {
-			// Check error type for better handling
-			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate limit") {
-				s.logger.Warnf("Rate limited while downloading HuggingFace model %s: %v", modelInfo, err)
-				s.metrics.RecordRateLimit(modelType, namespace, name, 30*time.Second) // Estimate
-				s.metrics.RecordFailedDownload(modelType, namespace, name, "rate_limit_error")
+				s.logger.Warnf("P2P download failed for model %s: %v, falling back to HuggingFace", modelInfo, err)
 			} else {
-				s.logger.Errorf("Failed to download HuggingFace model %s: %v", modelInfo, err)
-				s.metrics.RecordFailedDownload(modelType, namespace, name, "hf_download_error")
+				s.logger.Infof("No peers available for model %s, will attempt HuggingFace download", modelInfo)
 			}
 
-			s.markModelOnNodeFailed(task)
+			// Try to acquire lease for HuggingFace download
+			if s.p2pLeaseManager != nil {
+				leaseName := s.p2pLeaseManager.GetLeaseName(modelHash)
+				acquired, err := s.p2pLeaseManager.TryAcquire(ctx, leaseName)
+				if err != nil {
+					s.logger.Warnf("Failed to acquire P2P lease for model %s: %v", modelInfo, err)
+				}
+
+				if !acquired {
+					// Another node is downloading, wait for P2P availability
+					s.logger.Infof("Lease held by another node for model %s, waiting for P2P availability", modelInfo)
+					if err := s.waitForP2PAvailability(ctx, modelHash, modelInfo); err != nil {
+						s.logger.Warnf("Wait for P2P failed for model %s: %v, proceeding with HuggingFace download", modelInfo, err)
+					} else {
+						s.logger.Infof("Model %s now available via P2P", modelInfo)
+						goto parseConfig
+					}
+				} else {
+					// We have the lease, start renewal and download from HuggingFace
+					s.logger.Infof("Acquired lease for model %s, downloading from HuggingFace", modelInfo)
+					cancelRenewal := s.p2pLeaseManager.StartRenewal(ctx, leaseName)
+					defer cancelRenewal()
+
+					// Download from HuggingFace and seed
+					if err := s.downloadFromHuggingFace(ctx, task, baseModelSpec, hfComponents, destPath, modelInfo, modelType, namespace, name); err != nil {
+						// Release lease on failure
+						s.p2pLeaseManager.Release(ctx, leaseName)
+						return err
+					}
+
+					// Start seeding the downloaded model
+					if err := s.p2pDistributor.SeedModel(destPath, modelHash); err != nil {
+						s.logger.Warnf("Failed to start seeding model %s: %v", modelInfo, err)
+					} else {
+						s.logger.Infof("Started seeding model %s", modelInfo)
+					}
+
+					// Mark lease as complete
+					if err := s.p2pLeaseManager.MarkComplete(ctx, leaseName); err != nil {
+						s.logger.Warnf("Failed to mark lease complete for model %s: %v", modelInfo, err)
+					}
+
+					goto parseConfig
+				}
+			}
+		}
+
+		// Fallback: download directly from HuggingFace (P2P disabled or no lease manager)
+		if err := s.downloadFromHuggingFace(ctx, task, baseModelSpec, hfComponents, destPath, modelInfo, modelType, namespace, name); err != nil {
 			return err
 		}
 
-		s.logger.Infof("Successfully downloaded HuggingFace model %s to %s",
-			modelInfo, downloadPath)
+		// Start seeding if P2P is enabled (even without lease coordination)
+		if s.p2pEnabled && s.p2pDistributor != nil {
+			if err := s.p2pDistributor.SeedModel(destPath, modelHash); err != nil {
+				s.logger.Warnf("Failed to start seeding model %s: %v", modelInfo, err)
+			}
+		}
 	}
+
+parseConfig:
 
 	// Parse model config and update ConfigMap
 	var baseModel *v1beta1.BaseModel
@@ -1087,6 +1118,146 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 		s.logger.Errorf("Failed to parse and update model config: %v", err)
 	}
 	return nil
+}
+
+// downloadFromHuggingFace performs the actual download from HuggingFace Hub.
+// This is extracted to allow P2P integration to share the download logic.
+func (s *Gopher) downloadFromHuggingFace(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
+	hfComponents *storage.HuggingFaceStorageComponents, destPath, modelInfo, modelType, namespace, name string) error {
+
+	// Get Hugging Face token from storage key or parameters
+	hfToken := s.getHuggingFaceToken(task, baseModelSpec, modelInfo)
+
+	s.logger.Infof("Downloading HuggingFace model %s (revision: %s) to %s",
+		hfComponents.ModelID, hfComponents.Branch, destPath)
+
+	// Init xet HF download config
+	config := s.xetConfig.ToDownloadConfig()
+	config.LocalDir = destPath
+	config.RepoID = hfComponents.ModelID
+
+	// Set revision if specified
+	if hfComponents.Branch != "" {
+		config.Revision = hfComponents.Branch
+	}
+
+	// If we have a token, pass it as a download option
+	if hfToken != "" {
+		s.logger.Infof("Using authentication token for HuggingFace model %s", modelInfo)
+		config.Token = hfToken
+	}
+
+	// Create progress handler for tracking download progress
+	var lastBytes uint64
+	var lastTime = time.Now()
+	progressThrottle := 30 * time.Second // Update ConfigMap every 30 seconds
+
+	progressHandler := func(update xet.ProgressUpdate) {
+		now := time.Now()
+
+		// Calculate speed (bytes per second)
+		var speedBytesPerSec float64
+		elapsed := now.Sub(lastTime).Seconds()
+		if elapsed > 0 && update.CompletedBytes > lastBytes {
+			speedBytesPerSec = float64(update.CompletedBytes-lastBytes) / elapsed
+		}
+		lastBytes = update.CompletedBytes
+		lastTime = now
+
+		// Create progress object
+		progress := &DownloadProgress{
+			Phase:            update.Phase.String(),
+			TotalBytes:       update.TotalBytes,
+			CompletedBytes:   update.CompletedBytes,
+			TotalFiles:       update.TotalFiles,
+			CompletedFiles:   update.CompletedFiles,
+			SpeedBytesPerSec: speedBytesPerSec,
+			LastUpdated:      now.Format(time.RFC3339),
+		}
+
+		// Update ConfigMap with progress (non-blocking)
+		go func() {
+			progressOp := &ConfigMapProgressOp{
+				Progress:         progress,
+				BaseModel:        task.BaseModel,
+				ClusterBaseModel: task.ClusterBaseModel,
+			}
+			if err := s.configMapReconciler.ReconcileModelProgress(ctx, progressOp); err != nil {
+				s.logger.Warnf("Failed to update download progress for %s: %v", modelInfo, err)
+			}
+		}()
+	}
+
+	// Perform snapshot download with progress tracking
+	downloadPath, err := xet.SnapshotDownloadWithProgress(ctx, config, progressHandler, progressThrottle)
+
+	if err != nil {
+		// Check error type for better handling
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate limit") {
+			s.logger.Warnf("Rate limited while downloading HuggingFace model %s: %v", modelInfo, err)
+			s.metrics.RecordRateLimit(modelType, namespace, name, 30*time.Second)
+			s.metrics.RecordFailedDownload(modelType, namespace, name, "rate_limit_error")
+		} else {
+			s.logger.Errorf("Failed to download HuggingFace model %s: %v", modelInfo, err)
+			s.metrics.RecordFailedDownload(modelType, namespace, name, "hf_download_error")
+		}
+
+		s.markModelOnNodeFailed(task)
+		return err
+	}
+
+	s.logger.Infof("Successfully downloaded HuggingFace model %s to %s", modelInfo, downloadPath)
+	return nil
+}
+
+// waitForP2PAvailability waits for the model to become available via P2P.
+// This is used when another node holds the download lease.
+func (s *Gopher) waitForP2PAvailability(ctx context.Context, modelHash, modelInfo string) error {
+	if s.p2pDistributor == nil {
+		return fmt.Errorf("P2P distributor not configured")
+	}
+
+	// Poll for P2P availability with exponential backoff
+	maxAttempts := 60 // Max ~5 minutes with exponential backoff
+	baseDelay := 2 * time.Second
+	maxDelay := 30 * time.Second
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Check if model is available via P2P
+		if s.p2pDistributor.HasPeers(ctx, modelHash) {
+			s.logger.Infof("P2P peers now available for model %s, attempting download", modelInfo)
+			err := s.p2pDistributor.TryP2PDownload(ctx, modelHash, s.p2pTimeout)
+			if err == nil {
+				s.logger.Infof("Successfully downloaded model %s via P2P after waiting", modelInfo)
+				return nil
+			}
+			s.logger.Warnf("P2P download attempt failed for model %s: %v", modelInfo, err)
+		}
+
+		// Calculate delay with exponential backoff
+		delay := baseDelay * time.Duration(1<<uint(attempt/10))
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+
+		s.logger.Debugf("Waiting %v before next P2P check for model %s (attempt %d/%d)",
+			delay, modelInfo, attempt+1, maxAttempts)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+
+	return fmt.Errorf("timeout waiting for P2P availability for model %s", modelInfo)
 }
 
 /*
