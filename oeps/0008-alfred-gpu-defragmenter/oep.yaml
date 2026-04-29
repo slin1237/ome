@@ -1,0 +1,45 @@
+title: Alfred GPU Defragmenter
+oep-number: 0008
+authors:
+  - "@slin1237"
+status: provisional
+creation-date: 2026-04-16
+reviewers:
+  - TBD
+approvers:
+  - TBD
+
+see-also:
+  - "/.claude/designs/0007-omenative-workload-strategy"
+  - "/oeps/0003-accelerator-aware-runtime-selection"
+  - "/oeps/0006-unified-workload-management"
+replaces:
+  - "ome-operator/alfred (archived repository, auto-patch/auto-repair focus)"
+
+# The target maturity stage in the current dev cycle.
+stage: alpha
+
+latest-milestone: "TBD"
+
+milestone:
+  alpha: "TBD"
+  beta: "TBD"
+  stable: "TBD"
+
+feature-gates:
+  - name: AlfredGPUDefragmenter
+    description: |
+      Enables the Alfred defragmenter controller as an optional component
+      of the OME deployment. When disabled, Alfred does not observe or
+      act on the cluster.
+disable-supported: true
+
+metrics:
+  - alfred_cluster_fragmentation_score
+  - alfred_node_fragmentation_score
+  - alfred_recommendations_produced_total
+  - alfred_recommendations_accepted_total
+  - alfred_recommendations_rejected_total
+  - alfred_migration_calls_total
+  - alfred_migration_outcome_total
+  - alfred_observation_loop_duration_seconds

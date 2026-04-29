@@ -1,0 +1,43 @@
+title: OMENative Workload Strategy
+oep-number: 0007
+authors:
+  - "@slin1237"
+status: provisional
+creation-date: 2026-04-16
+reviewers:
+  - TBD
+approvers:
+  - TBD
+
+see-also:
+  - "/oeps/0006-unified-workload-management"
+  - "/.claude/designs/0008-alfred-gpu-defragmenter"
+
+# The target maturity stage in the current dev cycle for this OEP.
+stage: alpha
+
+# Draft — not yet tied to a release milestone. Implementation phasing is
+# expected to span multiple minor releases with a deliberately long
+# deprecation window for the LWS-backed modes.
+latest-milestone: "TBD"
+
+milestone:
+  alpha: "TBD"
+  beta: "TBD"
+  stable: "TBD"
+
+feature-gates:
+  - name: OMENativeWorkloadStrategy
+    description: |
+      Enables the OMENative workload strategy. When disabled, OME falls
+      back to the SingleComponentStrategy with the LWS-backed paths.
+disable-supported: true
+
+metrics:
+  - omenative_reconcile_duration_seconds
+  - omenative_instance_count
+  - omenative_migration_requests_total
+  - omenative_migration_duration_seconds
+  - omenative_migration_failures_total
+  - omenative_group_restart_total
+  - omenative_gang_scheduling_wait_seconds
